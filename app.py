@@ -29,17 +29,22 @@ messaging_api = MessagingApi(api_client)
 
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+CITY_ENDPOINTS = {    
+    "台北": "https://trafficapi.pma.gov.taipei/Parking/PayBill/CarID/{CarID}/CarType/{CarType}",
+    "台中": "http://tcparkingapi.taichung.gov.tw:8081/NationalParkingPayBillInquiry.Api/Parking/PayBill/CarID/{CarID}/CarType/{CarType}",    
+    "台南": "https://parkingbill.tainan.gov.tw/Parking/PayBill/CarID/{CarID}/CarType/{CarType}"  
+        
+}
+
 user_state = {}
 
-def query_parking_fees_taipei(plate: str, vehicle_type: str) -> str:
-    """
-    vehicle_type: 'C' 汽車, 'M' 機車
-    規範：Result 可能為 null（表示無待繳），或帶 Bills/Reminders 等欄位（JSON） 
-    """
+def call_city_api(city_name: str, plate: str, vehicle_type: str, timeout=2) -> dict:
+    """呼叫單一城市 API，回傳 {'city': city_name, 'ok': bool, 'text': str}"""
     try:
         safe_plate = quote(plate)
-        url = f"https://trafficapi.pma.gov.taipei/Parking/PayBill/CarID/{safe_plate}/CarType/{vehicle_type}"
-        r = requests.get(url, timeout=2)  # 規範建議查詢逾時 <= 2 秒
+        url_tpl = CITY_ENDPOINTS[city_name]
+        url = url_tpl.format(CarID=safe_plate, CarType=vehicle_type)
+        r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         data = r.json()
 
@@ -47,67 +52,70 @@ def query_parking_fees_taipei(plate: str, vehicle_type: str) -> str:
         message = data.get("Message", "")
         result = data.get("Result")
 
-        if status != "SUCCESS":
-            # 規範的錯誤會用 Status=錯誤碼（如 ERR01/ERR02/ERR03），Message=描述
-            return f"查詢失敗：{status or ''} {message or ''}".strip()
+        if status != "SUCCESS":            
+            return {"city": city_name, "ok": False, "text": f"{city_name} 查詢失敗：{status or ''} {message or ''}".strip()}
 
-        # SUCCESS 且沒有待繳
         if result is None:
-            return f"目前查無待繳停車費。\n車牌：{plate}\n車種：{'汽車' if vehicle_type=='C' else '機車'}"
+            return None
+        
+        lines = [f"【{city_name}】",
+                 f"筆數：{result.get('TotalCount', 0)}  總金額：NT$ {int(result.get('TotalAmount', 0))}"]
 
-        # 有待繳，整理欄位
-        lines = [
-            "【臺北市停車費查詢】",
-            f"車牌：{result.get('CarID', plate)}",
-            f"車種：{'汽車' if result.get('CarType')=='C' else '機車' if result.get('CarType')=='M' else (result.get('CarType') or vehicle_type)}",
-            f"筆數：{result.get('TotalCount', 0)}  總金額：NT$ {result.get('TotalAmount', 0)}",
-            ""
-        ]
-
-        # 停車單（未逾期/轉催繳中）
         bills = result.get("Bills", []) or []
         if bills:
             lines.append("— 停車單 —")
-            for i, b in enumerate(bills[:10], 1):
+            for i, b in enumerate(bills[:100], 1):
                 date = b.get("ParkingDate", "")
                 limit = b.get("PayLimitDate", "")
                 amt = b.get("PayAmount", b.get("Amount", 0))
                 hours = b.get("ParkingHours", "")
-                lines.append(f"{i}. {date}  截止:{limit}  時數:{hours}  應繳:NT$ {amt}")
-            lines.append("")
+                lines.append(f"{i}. {date} 截止:{limit} 時數:{hours} 應繳:NT$ {int(amt)}")
 
-        # 催繳單（逾期整合）
         reminders = result.get("Reminders", []) or []
         if reminders:
             lines.append("— 催繳單 —")
-            for i, rm in enumerate(reminders[:10], 1):
+            for i, rm in enumerate(reminders[:100], 1):
                 rno = rm.get("ReminderNo", "")
                 rlimit = rm.get("ReminderLimitDate", "")
                 rpay = rm.get("PayAmount", 0)
                 extra = rm.get("ExtraCharge", 0)
-                lines.append(f"{i}. 單號:{rno}  截止:{rlimit}  應繳:NT$ {rpay}（含工本費:{extra}）")
-                # 如要展開催繳內含的各筆 Bill，可在此再列出
-            lines.append("")
+                lines.append(f"{i}. 單號:{rno} 截止:{rlimit} 應繳:NT$ {rpay}（含工本費:{extra}）")
 
-        # 附帶城市/機關/時間（如果回傳有）
-        city = result.get("CityCode")
-        
-        footer_bits = []
-        if city: footer_bits.append(f"City:{city}")        
-        if footer_bits:
-            lines.append(" / ".join(footer_bits))
-
-        return "\n".join(lines)
+        return {"city": city_name, "ok": True, "text": "\n".join(lines)}
 
     except requests.exceptions.Timeout:
-        return "查詢逾時，請稍後再試。"
+        return {"city": city_name, "ok": False, "text": f"【{city_name}】查詢逾時，稍後再試。"}
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response else "HTTP"
-        return f"查詢失敗（{code}）。請稍後再試。"
+        return {"city": city_name, "ok": False, "text": f"【{city_name}】查詢失敗（{code}）。"}
     except ValueError:
-        return "回傳格式非 JSON，可能為暫時性異常。"
+        return {"city": city_name, "ok": False, "text": f"【{city_name}】回傳非 JSON（暫時性異常）。"}
     except Exception as e:
-        return f"查詢時發生錯誤：{e}"
+        return {"city": city_name, "ok": False, "text": f"【{city_name}】查詢錯誤"}
+
+def query_parking_fees_multi(plate: str, vehicle_type: str, cities=None) -> str:
+    
+    if cities is None:
+        cities = ["台北", "台中", "台南"]
+
+    header = [f"車牌：{plate}", f"車種：{'汽車' if vehicle_type=='C' else '機車'}", ""]
+    parts = []
+    for city in cities:
+        if city not in CITY_ENDPOINTS:
+            parts.append(f"【{city}】尚未支援。")
+            continue
+        res = call_city_api(city, plate, vehicle_type)
+        if not res:
+            # res 是 None = 該城查無待繳 → 不顯示
+            continue
+        if res.get("ok"):
+            parts.append(res["text"])
+        else:            
+            parts.append(res["text"])
+    
+    if not parts:
+        return "\n".join(header + ["目前所有查詢城市都沒有待繳。"])
+    return "\n".join(header + parts)
 
 
 @app.route("/callback", methods=['POST'])
@@ -127,12 +135,12 @@ def handle_text_message(event: MessageEvent):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    if text in ("查費", "查詢停車費", "查停車費"):
+    if text in ("查費", "查詢停車費", "查停車費","查詢"):
         user_state[user_id] = {"stage": "await_plate"}
         messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="請輸入車牌（可含英數/中文字/「-」，例如：ABC-1234 或 軍C-21110）")]
+                messages=[TextMessage(text="請輸入車牌（可含英數/中文字/「-」，例如：ABC-1234）")]
             )
         )
         return
@@ -179,7 +187,7 @@ def handle_text_message(event: MessageEvent):
     messaging_api.reply_message(
         ReplyMessageRequest(
             reply_token=event.reply_token,
-            messages=[TextMessage(text="輸入「查費」開始；或輸入車牌後依指示操作。")]
+            messages=[TextMessage(text="輸入「查費」開始。")]
         )
     )
 
@@ -204,7 +212,7 @@ def handle_postback(event: PostbackEvent):
         vehicle_type = data.split("=", 1)[1]  # C or M
         plate = state.get("plate")
 
-        result_text = query_parking_fees_taipei(plate, vehicle_type)
+        result_text = query_parking_fees_multi(plate, vehicle_type, cities=["台北", "台中", "台南"])
         messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
@@ -217,7 +225,7 @@ def handle_postback(event: PostbackEvent):
     messaging_api.reply_message(
         ReplyMessageRequest(
             reply_token=event.reply_token,
-            messages=[TextMessage(text="請輸入「查費」重新開始。")]
+            messages=[TextMessage(text="請輸入「查詢」重新開始。")]
         )
     )
 
